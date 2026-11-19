@@ -35,7 +35,7 @@ func TestNextBusyWrapsAcrossWords(t *testing.T) {
 func TestBusyBitmapLastQueueRemovalAndReuse(t *testing.T) {
 	d := NewDWRR[int](130)
 	mustEnqueue(t, d, 129, []Item[int]{{1, 1}, {2, 1}})
-	if got := d.Take(1); !reflect.DeepEqual(got, []Scheduled[int]{{129, 1, 1}}) || !d.active {
+	if got := takeN(d, 1); !reflect.DeepEqual(got, []Scheduled[int]{{129, 1, 1}}) || !d.active {
 		t.Fatalf("prepare active last queue: %v", got)
 	}
 	d.RemoveQueue()
@@ -54,7 +54,7 @@ func TestBusyBitmapLastQueueRemovalAndReuse(t *testing.T) {
 		t.Fatal("head removal left stale busy state")
 	}
 	mustEnqueue(t, d, 128, []Item[int]{{4, 1}})
-	if got := d.Take(1); !reflect.DeepEqual(got, []Scheduled[int]{{128, 4, 1}}) || d.busyCount != 0 || d.total != 0 || d.busy[2] != 0 {
+	if got := takeN(d, 1); !reflect.DeepEqual(got, []Scheduled[int]{{128, 4, 1}}) || d.busyCount != 0 || d.total != 0 || d.busy[2] != 0 {
 		t.Fatalf("Take left stale busy state: %v", got)
 	}
 }
@@ -76,7 +76,7 @@ func TestBusyBitmapSparseServiceOrder(t *testing.T) {
 		r.queues[q] = costs
 	}
 	for i := 0; i < 14; i++ {
-		if got, want := d.Take(1), r.take(1); !reflect.DeepEqual(got, want) {
+		if got, want := takeN(d, 1), r.take(1); !reflect.DeepEqual(got, want) {
 			t.Fatalf("item %d got=%v want=%v", i, got, want)
 		}
 		if d.cursor != r.cursor || d.active != r.active {

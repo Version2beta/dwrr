@@ -10,11 +10,12 @@ import (
 // Naive DRR with arbitrary-precision credit, used only to check the uint64
 // implementation at the top of its range.
 type bigRef struct {
-	q      [][]uint64
-	qt     []uint64
-	df     []*big.Int
-	cur    int
-	active bool
+	q          [][]uint64
+	qt         []uint64
+	getQuantum []func() uint64
+	df         []*big.Int
+	cur        int
+	active     bool
 }
 
 func (r *bigRef) close() { r.active = false; r.cur = (r.cur + 1) % len(r.q) }
@@ -37,7 +38,11 @@ func (r *bigRef) take(n int) []Scheduled[uint64] {
 				r.cur = (c + 1) % len(r.q)
 				continue
 			}
-			r.df[c].Add(r.df[c], new(big.Int).SetUint64(r.qt[c]))
+			x := r.qt[c]
+			if r.getQuantum[c] != nil {
+				x = r.getQuantum[c]()
+			}
+			r.df[c].Add(r.df[c], new(big.Int).SetUint64(x))
 			r.active = true
 		}
 		h := new(big.Int).SetUint64(r.q[c][0])
@@ -72,7 +77,7 @@ func TestExtremeDifferentialBigReference(t *testing.T) {
 	for trial := 0; trial < 20000; trial++ {
 		n := 1 + rng.Intn(4)
 		d := NewDWRR[uint64](uint(n))
-		r := &bigRef{q: make([][]uint64, n), qt: make([]uint64, n), df: make([]*big.Int, n)}
+		r := &bigRef{q: make([][]uint64, n), qt: make([]uint64, n), df: make([]*big.Int, n), getQuantum: make([]func() uint64, n)}
 		for i := 0; i < n; i++ {
 			x := quantum()
 			if err := d.SetQuantum(uint(i), x); err != nil {
@@ -80,9 +85,10 @@ func TestExtremeDifferentialBigReference(t *testing.T) {
 			}
 			r.qt[i], r.df[i] = x, new(big.Int)
 		}
+		var gotEvents, wantEvents []quantumEvent
 		for step := 0; step < 40; step++ {
 			i := rng.Intn(n)
-			switch rng.Intn(5) {
+			switch rng.Intn(6) {
 			case 0, 1:
 				c := cost()
 				if err := d.Enqueue(uint(i), []Item[uint64]{{c, c}}); err != nil {
@@ -93,6 +99,7 @@ func TestExtremeDifferentialBigReference(t *testing.T) {
 				x := quantum()
 				_ = d.SetQuantum(uint(i), x)
 				r.qt[i] = x
+				r.getQuantum[i] = nil
 			case 3:
 				got, ok := d.RemoveHead(uint(i))
 				if ok != (len(r.q[i]) > 0) || (ok && got.Cost != r.q[i][0]) {
@@ -107,11 +114,33 @@ func TestExtremeDifferentialBigReference(t *testing.T) {
 						}
 					}
 				}
+			case 4:
+				x := quantum()
+				makeSource := func(events *[]quantumEvent) func() uint64 {
+					calls := uint64(0)
+					queue := i
+					return func() uint64 {
+						value := x
+						if calls%2 != 0 {
+							value = MaxQuantum
+						}
+						calls++
+						*events = append(*events, quantumEvent{queue, value})
+						return value
+					}
+				}
+				if err := d.SetQuantum(uint(i), makeSource(&gotEvents)); err != nil {
+					t.Fatal(err)
+				}
+				r.getQuantum[i] = makeSource(&wantEvents)
 			default:
 				k := rng.Intn(4)
-				if a, b := d.Take(k), r.take(k); !reflect.DeepEqual(a, b) {
+				if a, b := takeN(d, k), r.take(k); !reflect.DeepEqual(a, b) {
 					t.Fatalf("trial %d step %d: got %v want %v", trial, step, a, b)
 				}
+			}
+			if !reflect.DeepEqual(gotEvents, wantEvents) {
+				t.Fatalf("trial %d step %d: callback trace mismatch: %v/%v", trial, step, gotEvents, wantEvents)
 			}
 			for j := range r.df {
 				if !r.df[j].IsUint64() || r.df[j].Uint64() != d.deficits[j] {
@@ -130,12 +159,12 @@ func TestBoundaryPeakCreditAfterReweight(t *testing.T) {
 	mustEnqueue(t, d, 0, []Item[int]{{1, MaxCost}, {2, 1}, {3, 1}})
 	mustEnqueue(t, d, 1, []Item[int]{{9, 1}})
 	// Queue 0 is granted MaxCost-1, blocks; queue 1 serves and empties.
-	if got := d.Take(1); !reflect.DeepEqual(got, []Scheduled[int]{{1, 9, 1}}) || d.deficits[0] != MaxCost-1 || d.active {
+	if got := takeN(d, 1); !reflect.DeepEqual(got, []Scheduled[int]{{1, 9, 1}}) || d.deficits[0] != MaxCost-1 || d.active {
 		t.Fatalf("setup: %v %d", got, d.deficits[0])
 	}
 	mustQuantum(t, d, 0, MaxQuantum) // credit is kept
 	d.RemoveHead(0)                  // exposes a cost-1 head
-	got := d.Take(1)                 // grant reaches MaxCost-1+MaxQuantum = 2^64-3
+	got := takeN(d, 1)               // grant reaches MaxCost-1+MaxQuantum = 2^64-3
 	if !reflect.DeepEqual(got, []Scheduled[int]{{0, 2, 1}}) || d.deficits[0] != ^uint64(0)-3 || !d.active {
 		t.Fatalf("peak: %v deficit=%d", got, d.deficits[0])
 	}

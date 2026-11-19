@@ -11,7 +11,7 @@ func BenchmarkTakeSparse10k(b *testing.B) {
 		if err := d.Enqueue(9_999, items); err != nil {
 			b.Fatal(err)
 		}
-		d.Take(1)
+		takeN(d, 1)
 	}
 }
 
@@ -28,7 +28,7 @@ func BenchmarkTakeRotating16(b *testing.B) {
 		if err := d.Enqueue(uint(i%16), []Item[int]{{Value: i, Cost: uint64(i%7 + 1)}}); err != nil {
 			b.Fatal(err)
 		}
-		d.Take(1)
+		takeN(d, 1)
 	}
 }
 
@@ -50,7 +50,7 @@ func BenchmarkTakeBacklogged16(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		item := d.Take(1)[0]
+		item := takeN(d, 1)[0]
 		items[0] = Item[int]{Value: item.Value, Cost: item.Cost}
 		if err := d.Enqueue(item.Queue, items); err != nil {
 			b.Fatal(err)
@@ -69,7 +69,7 @@ func BenchmarkTakeBatch64(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
-		d.Take(64)
+		takeN(d, 64)
 	}
 }
 
@@ -83,6 +83,38 @@ func BenchmarkLargeCostSmallQuantum(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
-		d.Take(8)
+		takeN(d, 8)
+	}
+}
+
+// Costs are deliberately bounded: callable sources cannot skip virtual rounds.
+func BenchmarkTakeDynamicBacklogged16(b *testing.B) {
+	d := NewDWRR[int](16)
+	for q := uint(0); q < 16; q++ {
+		quantum := uint64(q + 1)
+		if err := d.SetQuantum(q, func() uint64 { return quantum }); err != nil {
+			b.Fatal(err)
+		}
+		items := make([]Item[int], 64)
+		for i := range items {
+			items[i] = Item[int]{Value: int(q)*64 + i, Cost: uint64(i%7 + 1)}
+		}
+		if err := d.Enqueue(q, items); err != nil {
+			b.Fatal(err)
+		}
+	}
+	items := make([]Item[int], 1)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		batch, err := d.Take(1)
+		if err != nil {
+			b.Fatal(err)
+		}
+		item := batch[0]
+		items[0] = Item[int]{Value: item.Value, Cost: item.Cost}
+		if err := d.Enqueue(item.Queue, items); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

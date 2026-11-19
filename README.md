@@ -19,12 +19,34 @@ Deficit round robin keeps one queue per producer and serves them in turn. Each q
 
 | | |
 |---|---|
-| Version | v0.10.1 |
+| Latest published release | v0.10.1 (previous API) |
+| This checkout | Unreleased API changes; no release version selected |
 | Go | 1.22.2 or newer |
 | License | MIT |
-| Install | `go get github.com/version2beta/dwrr@v0.10.1` |
+| Install published release | `go get github.com/version2beta/dwrr@v0.10.1` |
 | Repository | [github.com/version2beta/dwrr](https://github.com/version2beta/dwrr) |
 | API reference | [pkg.go.dev/github.com/version2beta/dwrr](https://pkg.go.dev/github.com/version2beta/dwrr) |
+
+This README and its examples describe the **unreleased working-tree API**, not
+v0.10.1. Installing v0.10.1 does not provide callable quanta or the two-result
+`Take` below; see the [v0.10.1 documentation](https://github.com/version2beta/dwrr/tree/v0.10.1)
+for that release. To try these examples before publication, use this checkout
+(for an external consumer, a local `go.mod` `replace` pointing here).
+
+### Migrating from v0.10.1
+
+- Replace `batch := s.Take(n)` with `batch, err := s.Take(n)` and handle `err`
+  before processing the batch. Errors return a nil batch, with no partial
+  scheduling commit. Fixed-only busy queues still return nil errors.
+- `SetQuantum(queue, uint64Value)` calls still work, but its parameter is now
+  `any`; update interfaces or stored method signatures that require `uint64`.
+  Convert separately defined numeric types explicitly to a supported builtin.
+- To opt in to per-grant policies, pass an exact `func() uint64`, such as
+  `stream.GetQuantum`, not its result. Handle invalid-result errors and
+  `ErrStateChanged`; decide whether retries suit your application. Policies may
+  run speculatively and concurrently, outside scheduler locks. Synchronize their
+  state; do not rely on side effects being rolled back or on constant-path speed.
+- Item costs remain fixed at enqueue; callable quanta change allocation, not cost.
 
 ## Quick start
 
@@ -54,7 +76,11 @@ func main() {
 		panic(err)
 	}
 
-	for _, item := range s.Take(10) {
+	batch, err := s.Take(10)
+	if err != nil {
+		panic(err)
+	}
+	for _, item := range batch {
 		fmt.Printf("queue %d: %s (cost %d)\n", item.Queue, item.Value, item.Cost)
 	}
 }
@@ -108,7 +134,11 @@ func main() {
 
 	// Send 300 messages and count bytes per tenant.
 	sent := make([]uint64, len(tenants))
-	for _, item := range s.Take(300) {
+	batch, err := s.Take(300)
+	if err != nil {
+		panic(err)
+	}
+	for _, item := range batch {
 		sent[item.Queue] += item.Cost
 	}
 	var total uint64
@@ -180,14 +210,21 @@ func main() {
 	go func() {
 		handled := make([]int, 3)
 		for {
-			batch := s.Take(32)
+			batch, err := s.Take(32)
+			if err != nil {
+				panic(err)
+			}
 			if len(batch) == 0 {
 				select {
 				case <-wake:
 					continue
 				case <-ctx.Done():
 					// Take anything enqueued between the last check and cancellation.
-					for _, item := range s.Take(1 << 20) {
+					remaining, err := s.Take(1 << 20)
+					if err != nil {
+						panic(err)
+					}
+					for _, item := range remaining {
 						handled[item.Value.tenant]++
 					}
 					done <- handled
@@ -211,6 +248,53 @@ Output:
 ```text
 jobs handled per tenant: [1000 1000 1000]
 ```
+
+### Application-defined per-queue quanta
+
+`SetQuantum(queue, source)` accepts a numeric constant or an exact `func() uint64`.
+An application queue can own a `GetQuantum` method and supply its method value:
+
+```go
+if err := s.SetQuantum(queue, stream.GetQuantum); err != nil {
+    panic(err)
+}
+batch, err := s.Take(32)
+// Handle err before processing batch; no partial batch is returned on error.
+```
+
+The scheduler calls that queue's function **at every new grant**, not just once
+per `Take`, and not when resuming a visit that already received credit. The
+function may return a constant, but the scheduler cannot assume it will. `Take(n)`
+still batches retrieval: even `Take(1)` may need many grants to afford a head.
+Empty queues are not queried. Calls are speculative: a failed `Take` can discard
+planned grants, but not policy side effects. Stop delivering by letting a queue
+become empty, not by returning zero (which is an error, not a disabled queue).
+
+[The executable deadline example](example_test.go) gives each synthetic stream a
+`GetQuantum` method. The application supplies nonnegative elapsed `time.Duration`
+timestamps and absolute deadlines from the **same monotonic origin**, with no
+wall-clock reading or actual passage of time. Its policy returns the minimum
+quantum outside a positive ramp interval, interpolates with exact integer
+arithmetic (rounded down) as the deadline approaches, and clamps to the maximum
+at or past the deadline. It rejects negative timestamps, nonpositive ramps, and
+invalid quantum bounds. Wide multiplication avoids duration/quantum overflow.
+This policy lives entirely outside the library; no clocks, callbacks under locks,
+background updates, or media-specific behavior are built into the scheduler.
+
+**Allocation is not a deadline guarantee.** Grants are algorithmic visits, not
+elapsed-time ticks; execution time and completion deadlines remain application
+responsibilities. Synchronize any state captured by a function. Functions run
+outside the scheduler lock and can run concurrently in concurrent `Take` calls.
+
+**Cost of callable policies:** while any busy queue has a function, `Take` cannot
+skip unproductive rounds: later grants may return different values. Huge costs
+with tiny callable quanta can therefore require an impractical number of calls,
+including repeated calls to other busy queues. Use numeric constants when the
+allocation is fixed to retain fast-forward. A batch that starts with a busy
+function uses the unskipped planner for that entire batch, even if that queue
+empties before the batch finishes. Callable scheduling also copies
+queue metadata and up to `min(n, queue length)` costs per queue for optimistic
+planning; it does not copy payloads or hold the lock while evaluating policy.
 
 ### Withdrawing work
 
@@ -240,7 +324,11 @@ func main() {
 	if item, ok := s.RemoveHead(0); ok {
 		fmt.Println("withdrew", item.Value)
 	}
-	for _, item := range s.Take(10) {
+	batch, err := s.Take(10)
+	if err != nil {
+		panic(err)
+	}
+	for _, item := range batch {
 		fmt.Println("ran", item.Value)
 	}
 }
@@ -276,22 +364,27 @@ ran report-2
 - **Visits.** The scheduler visits queues in index order, cycling. At the start of a visit it adds the queue's quantum to the queue's credit, then serves FIFO heads while the credit covers their cost, subtracting each cost.
 - **Blocking within a queue.** A head the queue can't afford ends the visit and blocks the items behind it.
 - **Carry-over.** Unused credit carries forward while a queue has items, which is how an item costing more than one quantum eventually becomes eligible. An empty queue's credit resets to zero.
-- **Idle rounds.** When a complete round serves nothing, the scheduler skips the whole unproductive rounds in one step, crediting every waiting queue equally, then resumes visits in order.
+- **Idle rounds.** With numeric constants on every busy queue, the scheduler skips whole unproductive rounds in one step, adding each waiting queue's own quantum per skipped round, then resumes visits in order. A function on any busy queue disables skipping so every new grant can evaluate its current policy.
 - **Fairness is over declared costs,** not execution time, bytes on the wire or wall-clock use, unless those are what your costs measure.
 
 ### `Take`
 
-- `Take(n)` returns up to `n` items in service order. It returns fewer only when the queued work runs out.
+- `Take(n)` returns `([]Scheduled[T], error)`. On success it returns up to `n` items in service order, fewer only when queued work runs out. **The error return is an intentional API change:** existing callers must handle it.
 - **The limit is a retrieval limit, not a fairness cap.** If it interrupts a visit, the visit and its remaining credit persist, and the next call continues without granting another quantum.
-- `Take(0)` returns an empty, non-nil slice without changing anything. A negative `n` panics.
-- With no queues or no work, `Take` returns an empty, non-nil slice.
+- `Take(0)` returns an empty, non-nil slice and nil error without changing anything or evaluating any functions. A negative `n` panics first.
+- With no queues or no work, `Take` returns an empty, non-nil slice and nil error.
 - The returned slice never shares storage with the scheduler's queues.
+- Invalid callback results return `ErrZeroQuantum` or `ErrQuantumTooLarge`, with a nil batch. Callback panics propagate. Neither commits speculative selections, credit, or cursor changes, even if the failure follows earlier planned selections.
+- Concurrent mutation during callable scheduling returns a nil batch and `ErrStateChanged`, not an automatic callback retry. Handle this explicitly (for example, retry in the application if appropriate). Callback side effects, including scheduler mutations performed by a callback, are **not** rolled back. Other goroutines' committed work is unaffected.
+- If a callback result is invalid and state also changed, the quantum error takes precedence; state is checked only after a valid plan completes.
 
 ### Limits and errors
 
 - Costs and quanta are limited to `MaxCost` and `MaxQuantum`, both `uint64(1<<63 - 1)`.
 - `Enqueue` returns `ErrZeroCost` or `ErrCostTooLarge` and changes nothing if any item in the batch is invalid.
-- `SetQuantum` checks the queue index first, then returns `ErrZeroQuantum` for zero or `ErrQuantumTooLarge` above the limit, without changing anything.
+- `SetQuantum` checks the queue index first. Its `any` source accepts builtin `int`, `int8/16/32/64`, `uint`, `uint8/16/32/64`, `uintptr`, `float32/64`, or exact `func() uint64`. Aliases such as `byte` work; separately defined numeric/function types and other signatures/types panic (convert explicitly).
+- Constants must be positive whole numbers within `MaxQuantum`. Zero returns `ErrZeroQuantum`; negative, fractional, NaN/infinite values or a nil function return `ErrInvalidQuantum`; oversized whole numbers return `ErrQuantumTooLarge`. Floats are never silently rounded: `float64(MaxQuantum)` rounds to 2⁶³ and is rejected. Rejection changes nothing.
+- Function results are validated on each grant during `Take`, not during `SetQuantum`; functions must return a positive `uint64` no greater than `MaxQuantum`.
 - Credit uses exact `uint64` arithmetic:
   - Outside a visit, a queue's credit is at most `MaxCost − 1`.
   - A grant adds at most `MaxQuantum`.
@@ -300,7 +393,7 @@ ran report-2
 ### Changing queues during a visit
 
 - **`Enqueue`** appends items. Items added to the queue being visited join that visit without another quantum.
-- **`SetQuantum`** keeps the queue's credit and any visit in progress. The new quantum applies at the queue's next grant, not when a paused visit resumes. Setting the current quantum changes nothing.
+- **`SetQuantum`** keeps the queue's credit and any visit in progress, including fixed-to-function and function-to-fixed changes. The new source applies at the queue's next grant, not when a paused visit resumes. Setting the same numeric constant is a no-op; setting a function replaces the source without evaluating it.
 - **`RemoveHead`** removes the front item without scheduling it. It returns the item and `true`, or the zero item and `false` when the queue is empty. If items remain, the queue's credit and any visit in progress are kept. If the queue becomes empty, its credit resets and its visit ends.
 - **`DrainQueue`** removes and returns every item, resets the queue's credit, and ends its visit.
 - **`AddQueue`** doesn't affect existing indices or a visit in progress.
@@ -309,14 +402,17 @@ ran report-2
 
 ### Concurrency
 
-- Every method that reads or changes the scheduler holds its lock while it runs, so all methods are safe to call from multiple goroutines. `Take(0)` returns without locking, and a negative `Take` panics before locking. Don't copy a `DWRR` after first use.
+- Scheduler state is mutex-protected. With only constants on busy queues, `Take` selects a batch under that lock. Callable scheduling snapshots cost prefixes, queue lengths, sources, credit and position under lock, evaluates policy outside all scheduler locks, and commits only if its state generation is unchanged. This makes the whole successful batch atomic with respect to other operations, including remove/re-add of the same queue index.
+- Every actual mutation invalidates outstanding plans. Two concurrent callable `Take` calls can evaluate the same source; only a plan whose generation still matches can commit. A callback can call scheduler methods without a scheduler-lock deadlock, but mutating state invalidates its outer plan. Avoid uncontrolled recursive policy calls and synchronize application state yourself.
+- Generations never wrap: after 2⁶⁴−1 state changes, the next mutation panics before changing state, preventing an old snapshot from matching a reused generation. This also applies to fixed-only scheduling: current-Go conformance to the shared all-sequences specification is qualified by this lifetime restriction, not an added shared limit for Elixir or Python.
+- `Take(0)` returns without locking, and a negative `Take` panics before locking. Don't copy a `DWRR` after first use.
 - `Take` selects and removes work; running it, and running it concurrently, is up to you.
-- The lock protects the scheduler's state, not the values you store in `T`.
+- The lock protects the scheduler's state, not the values you store in `T` or mutable state used by `GetQuantum`. Values of `T` are still shallow-copied.
 
 ## How we know it's correct
 
 - **A deliberately naive reference.** The test suite includes a reference scheduler that visits one queue at a time, never skips anything, and is short enough to check by reading.
-- **Differential tests** run thousands of random operation sequences against the reference and this library, covering every method including changes made in the middle of a visit. Results must match exactly. A fuzz target does the same with generated input, and CI fuzzes it on every push.
+- **Differential tests** run thousands of random operation sequences against the reference and this library, including per-grant functions and changes made in the middle of a visit. Results, credit and independent callback event traces must match exactly. A fuzz target preserves the original operation decoder and also exercises functions in a second pass; CI fuzzes it on every push.
 - **Large-number tests.** A second reference with arbitrary-precision credit covers costs and quanta near the 2⁶³ limit.
 - **Exactness.** A boundary test drives credit to its maximum, `2⁶⁴ − 3`.
 
@@ -334,7 +430,7 @@ ran report-2
    ```sh
    go test -run='^$' -fuzz=FuzzDifferential -fuzztime=60s
    ```
-3. Plant a bug. In `dwrr.go`, find the check in `Take` that decides whether a queue can afford its next item:
+3. Plant a bug. In `dwrr.go`, find the check in `takeFixed` that decides whether a queue can afford its next item:
    ```go
    if d.deficits[q] < head.Cost {
    ```
@@ -342,7 +438,7 @@ ran report-2
    ```sh
    go test -run TestDifferentialRandom
    ```
-   The test fails within a second. For each failing case it shows what the library returned, what the reference returned, and the sequence of operations that produced the difference. Undo the change with `git checkout dwrr.go`.
+   The test reports what the library returned, what the reference returned, and the sequence of operations that produced the difference. Try this only in a disposable copy, or save `dwrr.go` first and restore that saved copy afterward. `git checkout dwrr.go` would discard all uncommitted implementation work.
 
 ## How it compares
 

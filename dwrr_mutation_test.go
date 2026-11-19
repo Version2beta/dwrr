@@ -51,7 +51,7 @@ func TestReferenceGeneratedMutationScenarios(t *testing.T) {
 					limit = 2 + rng.Intn(5)
 				}
 				trace = append(trace, fmt.Sprintf("Take(%d)", limit))
-				got, want := d.Take(limit), r.take(limit)
+				got, want := takeN(d, limit), r.take(limit)
 				if !reflect.DeepEqual(got, want) {
 					t.Fatalf("seed=%d scenario=%d step=%d Take(%d) got=%v want=%v\ntrace=%v", seed, scenario, step, limit, got, want, trace)
 				}

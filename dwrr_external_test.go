@@ -13,10 +13,10 @@ func TestPublicCostAwareAPI(t *testing.T) {
 	require.NoError(t, scheduler.SetQuantum(1, 3))
 	require.NoError(t, scheduler.Enqueue(0, []dwrr.Item[string]{{Value: "a", Cost: 2}, {Value: "b", Cost: 2}}))
 	require.NoError(t, scheduler.Enqueue(1, []dwrr.Item[string]{{Value: "x", Cost: 4}, {Value: "y", Cost: 1}}))
-	require.Equal(t, []dwrr.Scheduled[string]{{Queue: 0, Value: "a", Cost: 2}}, scheduler.Take(1))
-	require.Equal(t, []dwrr.Scheduled[string]{{Queue: 0, Value: "b", Cost: 2}}, scheduler.Take(1))
-	require.Equal(t, []dwrr.Scheduled[string]{{Queue: 1, Value: "x", Cost: 4}}, scheduler.Take(1))
-	require.Equal(t, []dwrr.Scheduled[string]{{Queue: 1, Value: "y", Cost: 1}}, scheduler.Take(1))
+	require.Equal(t, []dwrr.Scheduled[string]{{Queue: 0, Value: "a", Cost: 2}}, takeN(scheduler, 1))
+	require.Equal(t, []dwrr.Scheduled[string]{{Queue: 0, Value: "b", Cost: 2}}, takeN(scheduler, 1))
+	require.Equal(t, []dwrr.Scheduled[string]{{Queue: 1, Value: "x", Cost: 4}}, takeN(scheduler, 1))
+	require.Equal(t, []dwrr.Scheduled[string]{{Queue: 1, Value: "y", Cost: 1}}, takeN(scheduler, 1))
 }
 
 func TestPublicDirectQueueRemovalAPI(t *testing.T) {
@@ -31,4 +31,36 @@ func TestPublicDirectQueueRemovalAPI(t *testing.T) {
 	item, ok = scheduler.RemoveHead(queue)
 	require.False(t, ok)
 	require.Equal(t, dwrr.Item[string]{}, item)
+}
+
+// takeN keeps the fixed-policy external fixtures concise while checking errors.
+func takeN[T any](d *dwrr.DWRR[T], n int) []dwrr.Scheduled[T] {
+	out, err := d.Take(n)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+func TestPublicQuantumFunctionAPI(t *testing.T) {
+	s := dwrr.NewDWRR[string](1)
+	calls := 0
+	require.NoError(t, s.SetQuantum(0, func() uint64 { calls++; return 2 }))
+	require.NoError(t, s.Enqueue(0, []dwrr.Item[string]{{Value: "a", Cost: 3}, {Value: "b", Cost: 1}}))
+	out, err := s.Take(0)
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	require.Empty(t, out)
+	require.Zero(t, calls)
+	out, err = s.Take(2)
+	require.NoError(t, err)
+	require.Equal(t, []dwrr.Scheduled[string]{{Queue: 0, Value: "a", Cost: 3}, {Queue: 0, Value: "b", Cost: 1}}, out)
+	require.Equal(t, 2, calls)
+	require.NoError(t, s.SetQuantum(0, 2.0))
+	require.ErrorIs(t, s.SetQuantum(0, 1.5), dwrr.ErrInvalidQuantum)
+	require.NoError(t, s.SetQuantum(0, func() uint64 { return 0 }))
+	require.NoError(t, s.Enqueue(0, []dwrr.Item[string]{{Value: "c", Cost: 1}}))
+	out, err = s.Take(1)
+	require.Nil(t, out)
+	require.ErrorIs(t, err, dwrr.ErrZeroQuantum)
 }

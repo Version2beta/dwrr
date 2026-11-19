@@ -5,6 +5,7 @@ package dwrr
 
 import (
 	"errors"
+	"math"
 	"math/bits"
 	"sync"
 )
@@ -17,14 +18,19 @@ const (
 )
 
 var (
-	// ErrZeroQuantum is returned when SetQuantum is given a zero quantum.
+	// ErrZeroQuantum reports a zero constant or callback quantum.
 	ErrZeroQuantum = errors.New("dwrr: quantum must be positive")
 	// ErrZeroCost is returned when Enqueue receives an item with zero cost.
 	ErrZeroCost = errors.New("dwrr: item cost must be positive")
 	// ErrCostTooLarge is returned when Enqueue receives a cost above MaxCost.
 	ErrCostTooLarge = errors.New("dwrr: item cost exceeds MaxCost")
-	// ErrQuantumTooLarge is returned when SetQuantum receives a value above MaxQuantum.
+	// ErrQuantumTooLarge reports a constant or callback quantum above MaxQuantum.
 	ErrQuantumTooLarge = errors.New("dwrr: quantum exceeds MaxQuantum")
+	// ErrInvalidQuantum reports a negative, fractional, nonfinite constant or nil function.
+	ErrInvalidQuantum = errors.New("dwrr: invalid quantum source")
+	// ErrStateChanged means scheduling state changed while Take evaluated functions.
+	// Take commits no selections or credit on this error; callers may retry.
+	ErrStateChanged = errors.New("dwrr: state changed during Take")
 )
 
 // Item is a payload and its positive scheduling cost. Enqueue copies the item
@@ -44,9 +50,12 @@ type Scheduled[T any] struct {
 // DWRR is a concurrent-safe cost-aware deficit round-robin scheduler. Do not
 // copy it after first use. Its zero value is unusable; use NewDWRR.
 type DWRR[T any] struct {
-	mu       sync.Mutex
-	queues   [][]Item[T]
-	quantums []uint64
+	mu           sync.Mutex
+	queues       [][]Item[T]
+	quantums     []uint64
+	quantumFuncs []func() uint64
+	dynamicCount int    // Configured functions, including empty queues.
+	generation   uint64 // Never wraps: exhaustion panics before any mutation.
 	// Outside an active visit, deficit is at most MaxCost-1: a visit closes
 	// below its head's cost (at most MaxCost), and emptying resets credit.
 	// RemoveHead can expose a cheaper head but never increases deficit.
@@ -66,30 +75,123 @@ type DWRR[T any] struct {
 // change the count, with RemoveQueue affecting only the last queue.
 func NewDWRR[T any](count uint) *DWRR[T] {
 	n := int(count)
-	d := &DWRR[T]{queues: make([][]Item[T], n), quantums: make([]uint64, n), deficits: make([]uint64, n), busy: make([]uint64, (n+63)/64)}
+	d := &DWRR[T]{queues: make([][]Item[T], n), quantums: make([]uint64, n), quantumFuncs: make([]func() uint64, n), deficits: make([]uint64, n), busy: make([]uint64, (n+63)/64)}
 	for i := range d.quantums {
 		d.quantums[i] = 1
 	}
 	return d
 }
 
-// SetQuantum changes a queue's quantum while keeping its deficit and any
-// active visit. The new quantum is used at the next grant, not when a paused
-// visit resumes. Setting the current quantum is a no-op. Zero quantum returns
-// ErrZeroQuantum; a quantum above MaxQuantum returns ErrQuantumTooLarge.
-// Both errors leave state unchanged. Invalid indices panic first.
-func (d *DWRR[T]) SetQuantum(queue uint, quantum uint64) error {
+// SetQuantum configures a constant or a per-queue func() uint64. Builtin integer
+// and floating-point types are accepted; floats must be finite whole numbers.
+// Constants and function results must be in [1, MaxQuantum]. A nil function,
+// negative, fractional, or nonfinite number returns ErrInvalidQuantum; zero
+// returns ErrZeroQuantum; an oversized number returns ErrQuantumTooLarge.
+// Unsupported types (including defined numeric/function types) panic. An invalid
+// index panics first. Rejected sources leave state unchanged.
+//
+// Credit and an active visit survive changes. The source is used only at the
+// next grant, never to resume an active visit. Functions run outside the lock
+// during Take, once per planned new grant, including multiple grants in one
+// Take. A failed Take can discard those grants, but not function side effects.
+func (d *DWRR[T]) SetQuantum(queue uint, source any) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	configuredQuantum := &d.quantums[queue] // Preserve slice-index panic behavior.
+	_ = d.quantums[queue] // Preserve index panic precedence.
+	quantum, getQuantum, err := quantumSource(source)
+	if err != nil {
+		return err
+	}
+	if getQuantum == nil && d.quantumFuncs[queue] == nil && d.quantums[queue] == quantum {
+		return nil
+	}
+	d.change()
+	if d.quantumFuncs[queue] != nil {
+		d.dynamicCount--
+	}
+	if getQuantum != nil {
+		d.dynamicCount++
+	}
+	d.quantums[queue], d.quantumFuncs[queue] = quantum, getQuantum
+	return nil
+}
+
+func quantumSource(source any) (uint64, func() uint64, error) {
+	var signed int64
+	var quantum uint64
+	switch x := source.(type) {
+	case func() uint64:
+		if x == nil {
+			return 0, nil, ErrInvalidQuantum
+		}
+		return 0, x, nil
+	case int:
+		signed = int64(x)
+	case int8:
+		signed = int64(x)
+	case int16:
+		signed = int64(x)
+	case int32:
+		signed = int64(x)
+	case int64:
+		signed = x
+	case uint:
+		quantum = uint64(x)
+	case uint8:
+		quantum = uint64(x)
+	case uint16:
+		quantum = uint64(x)
+	case uint32:
+		quantum = uint64(x)
+	case uint64:
+		quantum = x
+	case uintptr:
+		quantum = uint64(x)
+	case float32:
+		return floatQuantum(float64(x))
+	case float64:
+		return floatQuantum(x)
+	default:
+		panic("dwrr: unsupported quantum source")
+	}
+	if signed < 0 {
+		return 0, nil, ErrInvalidQuantum
+	}
+	if signed > 0 {
+		quantum = uint64(signed)
+	}
+	return quantum, nil, validateQuantum(quantum)
+}
+
+func floatQuantum(x float64) (uint64, func() uint64, error) {
+	if math.IsNaN(x) || math.IsInf(x, 0) || x < 0 || math.Trunc(x) != x {
+		return 0, nil, ErrInvalidQuantum
+	}
+	// float64(MaxQuantum) rounds UP to 2^63, which is not an accepted quantum.
+	if x >= 0x1p63 {
+		return 0, nil, ErrQuantumTooLarge
+	}
+	quantum := uint64(x)
+	return quantum, nil, validateQuantum(quantum)
+}
+
+func validateQuantum(quantum uint64) error {
 	if quantum == 0 {
 		return ErrZeroQuantum
 	}
 	if quantum > MaxQuantum {
 		return ErrQuantumTooLarge
 	}
-	*configuredQuantum = quantum
 	return nil
+}
+
+// change invalidates optimistic plans. Exhaustion cannot alias an old snapshot.
+// Call before mutating state, with d.mu held.
+func (d *DWRR[T]) change() {
+	if d.generation == ^uint64(0) {
+		panic("dwrr: state generation exhausted")
+	}
+	d.generation++
 }
 
 // Enqueue validates the complete input before appending it atomically. New
@@ -111,6 +213,7 @@ func (d *DWRR[T]) Enqueue(queue uint, items []Item[T]) error {
 	if len(items) == 0 {
 		return nil
 	}
+	d.change()
 	wasEmpty := len(*queueItems) == 0
 	*queueItems = append(*queueItems, items...)
 	d.total += len(items)
@@ -127,9 +230,11 @@ func (d *DWRR[T]) Enqueue(queue uint, items []Item[T]) error {
 func (d *DWRR[T]) AddQueue() uint {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.change()
 	index := uint(len(d.queues))
 	d.queues = append(d.queues, nil)
 	d.quantums = append(d.quantums, 1)
+	d.quantumFuncs = append(d.quantumFuncs, nil)
 	d.deficits = append(d.deficits, 0)
 	if index%64 == 0 {
 		d.busy = append(d.busy, 0)
@@ -147,7 +252,13 @@ func (d *DWRR[T]) RemoveQueue() {
 	if n == 0 {
 		return
 	}
+	d.change()
 	last := n - 1
+	if d.quantumFuncs[last] != nil {
+		d.dynamicCount--
+	}
+	d.quantumFuncs[last] = nil
+	d.quantumFuncs = d.quantumFuncs[:last]
 	if d.active && d.cursor == last {
 		d.active = false
 		d.cursor = 0
@@ -181,6 +292,7 @@ func (d *DWRR[T]) RemoveHead(queue uint) (Item[T], bool) {
 	if len(d.queues[q]) == 0 {
 		return Item[T]{}, false
 	}
+	d.change()
 	return d.popHead(q), true
 }
 
@@ -211,6 +323,9 @@ func (d *DWRR[T]) DrainQueue(queue uint) []Item[T] {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	q := int(queue)
+	if d.queues[q] != nil {
+		d.change()
+	}
 	items := append([]Item[T](nil), d.queues[q]...)
 	if len(d.queues[q]) > 0 {
 		d.total -= len(d.queues[q])
@@ -226,19 +341,77 @@ func (d *DWRR[T]) DrainQueue(queue uint) []Item[T] {
 	return items
 }
 
-// Take returns up to n items in service order. A limit can pause an active
-// visit; its credit and position persist for the next call. Take(0) returns a
-// nonnil empty slice without changing state. Negative n panics. The returned
-// slice is always nonnil and never aliases internal queue storage.
-func (d *DWRR[T]) Take(n int) []Scheduled[T] {
+// Take returns up to n items in service order, preserving unfinished visits.
+// Take(0) returns a nonnil empty slice without evaluating sources or locking;
+// negative n panics. Empty schedulers return a nonnil empty slice and nil error.
+//
+// If any busy queue has a function source, Take plans speculatively, invoking
+// functions outside all scheduler locks on each new grant. Invalid results
+// return a quantum error; concurrent state changes return ErrStateChanged.
+// Either error returns nil and commits no selections, credit, or cursor changes.
+// Function panics propagate with the same no-commit guarantee. Application
+// side effects (including changes made by a function) cannot be rolled back.
+// Calls are speculative: their grants may never commit. No automatic retry
+// occurs. Callers must synchronize captured function state;
+// concurrent Takes may invoke the same function concurrently.
+func (d *DWRR[T]) Take(n int) ([]Scheduled[T], error) {
 	if n < 0 {
 		panic("dwrr: negative Take limit")
 	}
 	if n == 0 {
-		return make([]Scheduled[T], 0)
+		return make([]Scheduled[T], 0), nil
+	}
+	d.mu.Lock()
+	if !d.hasDynamicBusy() {
+		defer d.mu.Unlock()
+		if d.total > 0 {
+			d.change()
+		}
+		return d.takeFixed(n), nil
+	}
+	plan := d.plan(n)
+	generation := d.generation
+	d.mu.Unlock()
+	if err := plan.run(); err != nil {
+		return nil, err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.generation != generation {
+		return nil, ErrStateChanged
+	}
+	d.change()
+	out := make([]Scheduled[T], 0, len(plan.order))
+	for _, q := range plan.order {
+		head := d.popHead(q)
+		out = append(out, Scheduled[T]{Queue: uint(q), Value: head.Value, Cost: head.Cost})
+	}
+	for q := range plan.queues {
+		d.deficits[q] = plan.queues[q].deficit
+	}
+	d.cursor, d.active = plan.cursor, plan.active
+	return out, nil
+}
+
+// hasDynamicBusy ignores callable sources on empty queues. Caller holds d.mu.
+func (d *DWRR[T]) hasDynamicBusy() bool {
+	if d.dynamicCount == 0 {
+		return false
+	}
+	for word, busy := range d.busy {
+		for busy != 0 {
+			q := word*64 + bits.TrailingZeros64(busy)
+			busy &= busy - 1
+			if d.quantumFuncs[q] != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// takeFixed uses stable constants for all busy queues. Caller holds d.mu.
+func (d *DWRR[T]) takeFixed(n int) []Scheduled[T] {
 	out := make([]Scheduled[T], 0, min(n, d.total))
 	// Count grants since service, excluding a visit already active on entry.
 	grantsSinceService := 0
@@ -285,6 +458,80 @@ func (d *DWRR[T]) Take(n int) []Scheduled[T] {
 		}
 	}
 	return out
+}
+
+// A plan copies costs only, not payloads. At most n heads per queue can be
+// removed, but remaining tracks the true length so truncated prefixes never
+// incorrectly empty a queue or discard its credit. Caller holds d.mu in plan.
+type plannedQueue struct {
+	costs               []uint64
+	remaining, consumed int
+	quantum, deficit    uint64
+	getQuantum          func() uint64
+}
+type takePlan struct {
+	queues        []plannedQueue
+	order         []int
+	limit, cursor int
+	active        bool
+}
+
+func (d *DWRR[T]) plan(n int) takePlan {
+	limit := min(n, d.total)
+	prefixCount := 0
+	for _, queue := range d.queues {
+		prefixCount += min(limit, len(queue)) // Sum is at most d.total.
+	}
+	costs := make([]uint64, 0, prefixCount)
+	p := takePlan{queues: make([]plannedQueue, len(d.queues)), order: make([]int, 0, limit), limit: limit, cursor: d.cursor, active: d.active}
+	for q, queue := range d.queues {
+		start := len(costs)
+		for _, item := range queue[:min(limit, len(queue))] {
+			costs = append(costs, item.Cost)
+		}
+		p.queues[q] = plannedQueue{costs: costs[start:len(costs)], remaining: len(queue), quantum: d.quantums[q], deficit: d.deficits[q], getQuantum: d.quantumFuncs[q]}
+	}
+	return p
+}
+
+func (p *takePlan) close() {
+	p.active = false
+	p.cursor = (p.cursor + 1) % len(p.queues)
+}
+
+func (p *takePlan) run() error {
+	for len(p.order) < p.limit {
+		q := &p.queues[p.cursor]
+		if !p.active {
+			if q.remaining == 0 {
+				p.close()
+				continue
+			}
+			quantum := q.quantum
+			if q.getQuantum != nil {
+				quantum = q.getQuantum()
+				if err := validateQuantum(quantum); err != nil {
+					return err
+				}
+			}
+			q.deficit += quantum
+			p.active = true
+		}
+		cost := q.costs[q.consumed]
+		if q.deficit < cost {
+			p.close()
+			continue
+		}
+		q.deficit -= cost
+		q.remaining--
+		q.consumed++
+		p.order = append(p.order, p.cursor)
+		if q.remaining == 0 {
+			q.deficit = 0
+			p.close()
+		}
+	}
+	return nil
 }
 
 // nextBusy finds the first nonempty queue at or after from, wrapping once.

@@ -7,10 +7,10 @@ func TestEmptyingQueueReusesStorage(t *testing.T) {
 		d := NewDWRR[int](1)
 		items := []Item[int]{{Value: 7, Cost: 1}}
 		mustEnqueue(t, d, 0, items)
-		d.Take(1) // Warm the queue storage before measuring.
+		takeN(d, 1) // Warm the queue storage before measuring.
 		allocations := testing.AllocsPerRun(100, func() {
 			mustEnqueue(t, d, 0, items)
-			if got := d.Take(1); len(got) != 1 || got[0] != (Scheduled[int]{Queue: 0, Value: 7, Cost: 1}) {
+			if got := takeN(d, 1); len(got) != 1 || got[0] != (Scheduled[int]{Queue: 0, Value: 7, Cost: 1}) {
 				t.Fatalf("unexpected service: %v", got)
 			}
 		})
@@ -46,7 +46,7 @@ func TestEmptyingQueueClearsRetainedSlots(t *testing.T) {
 			backing := d.queues[0][:cap(d.queues[0])]
 			for _, want := range items {
 				if method == "Take" {
-					if got := d.Take(1); len(got) != 1 || got[0].Value != want.Value || got[0].Cost != want.Cost {
+					if got := takeN(d, 1); len(got) != 1 || got[0].Value != want.Value || got[0].Cost != want.Cost {
 						t.Fatalf("unexpected service: %v", got)
 					}
 				} else if got, ok := d.RemoveHead(0); !ok || got != want {
@@ -78,7 +78,7 @@ func TestDrainQueueReleasesStorage(t *testing.T) {
 			mustEnqueue(t, d, 0, []Item[int]{{Value: 1, Cost: 1}})
 			switch state {
 			case "Take":
-				d.Take(1)
+				takeN(d, 1)
 			case "RemoveHead":
 				d.RemoveHead(0)
 			}
