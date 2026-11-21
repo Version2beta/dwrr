@@ -6,6 +6,35 @@
 Also published at [version2beta.com](https://version2beta.com/tools/dwrr-go/).
 <!-- /site:skip -->
 
+## Other languages
+
+- [DWRR for Python](https://github.com/version2beta/dwrr-python)
+- [DWRR for Elixir](https://github.com/version2beta/dwrr-elixir)
+
+These libraries share fixed-quantum scheduling semantics, with language-specific
+APIs and additional features. See each library's README for its supported contract.
+
+## Shared specification
+
+[dwrr-spec](https://github.com/version2beta/dwrr-spec) defines the shared
+[fixed-quantum contract](https://github.com/version2beta/dwrr-spec/blob/main/SPEC.md),
+[conformance corpus](https://github.com/version2beta/dwrr-spec/tree/main/corpus)
+and [driver protocol](https://github.com/version2beta/dwrr-spec/blob/main/PROTOCOL.md) /
+[conformance tools](https://github.com/version2beta/dwrr-spec/tree/main/tools).
+They let implementations with different APIs check the same service order,
+errors and numeric limits rather than rely on similar-looking algorithms.
+This is a development/conformance resource, **not a runtime dependency**.
+Pinned revisions and vendored snapshots make checks reproducible; they do not
+automatically track current spec source or establish all-sequences conformance.
+
+The shared target is the fixed-quantum core. This checkout's callable quanta,
+callback errors and speculative scheduling are local extensions, not shared
+requirements. Its generation-exhaustion restriction also qualifies fixed-core
+conformance; see [behavior and limits](#behavior-worth-knowing). The spec's Go
+adapter pins published v0.10.1; replay against this unreleased checkout must be
+identified separately. Go CI tests this checkout, not an automatic current-spec
+replay gate.
+
 ## The need
 
 When several producers share one consumer, a single busy producer can take most of the consumer's attention:
@@ -13,7 +42,7 @@ When several producers share one consumer, a single busy producer can take most 
 - Strict priority starves the lower levels.
 - Plain round robin counts turns rather than work, so a producer with expensive items gets more than its share.
 
-Deficit round robin keeps one queue per producer and serves them in turn. Each queue earns credit in proportion to its weight and spends it on the costs you declare for each item: bytes, tokens, estimated work, or simply 1 per item. Over time each busy queue gets its weighted share of the total cost served, and an idle queue gives its share to the others.
+Deficit round robin keeps one queue per producer and serves them in turn. Each queue earns credit in proportion to its weight and spends it on the costs you declare for each item: bytes, tokens, estimated work, or simply 1 per item. With fixed quanta and continuously backlogged queues, served cost approaches the quantum proportions over enough visits, subject to item granularity. Empty queues consume no service; short prefixes and changing backlogs need not match those proportions.
 
 ## At a glance
 
@@ -159,11 +188,11 @@ bravo     119100 bytes  50.3%
 charlie    58132 bytes  24.5%
 ```
 
-The shares follow the weights in bytes, even though message sizes vary from 64 to 1,500 bytes.
+The shares approximate the weights in bytes, even though message sizes vary from 64 to 1,500 bytes. This is a backlogged prefix, not a guarantee about the final totals after all queues drain. The Python and Elixir libraries have a separate, matched Basic/Team/Business file-transfer simulation; this Go example uses a different dataset.
 
 ### A worker loop
 
-`Take` never waits for work to arrive: when the scheduler is empty, it returns an empty slice. Like every other method, it may wait briefly for the scheduler's lock. Producers enqueue work and send a non-blocking wake-up; the worker takes a batch at a time and waits on the wake channel when the scheduler is empty.
+`Take` never waits for work to arrive: when the scheduler is empty, it returns an empty slice. It may wait for the scheduler's lock; callable policies also take application-defined time. Producers enqueue work and send a non-blocking wake-up; the worker takes a batch at a time and waits on the wake channel when the scheduler is empty.
 
 ```go
 package main
@@ -365,7 +394,7 @@ ran report-2
 - **Blocking within a queue.** A head the queue can't afford ends the visit and blocks the items behind it.
 - **Carry-over.** Unused credit carries forward while a queue has items, which is how an item costing more than one quantum eventually becomes eligible. An empty queue's credit resets to zero.
 - **Idle rounds.** With numeric constants on every busy queue, the scheduler skips whole unproductive rounds in one step, adding each waiting queue's own quantum per skipped round, then resumes visits in order. A function on any busy queue disables skipping so every new grant can evaluate its current policy.
-- **Fairness is over declared costs,** not execution time, bytes on the wire or wall-clock use, unless those are what your costs measure.
+- **Fairness is over declared costs,** with proportional service for fixed quanta and continuously backlogged queues, not arbitrary changing policies/backlogs. It does not measure execution time, bytes on the wire or wall-clock use.
 
 ### `Take`
 
@@ -409,6 +438,15 @@ ran report-2
 - `Take` selects and removes work; running it, and running it concurrently, is up to you.
 - The lock protects the scheduler's state, not the values you store in `T` or mutable state used by `GetQuantum`. Values of `T` are still shallow-copied.
 
+### Resource ownership
+
+There are no built-in queue capacity limits, admission control, backpressure or
+persistence. Memory and native integer/allocation limits still apply; “no size
+limits” is not an unlimited-resource guarantee. The scheduler starts no workers
+and does no job execution or I/O itself (application callbacks may do so).
+`Take` selects whole items, without preemption or bandwidth pacing. For smoother
+byte interleaving, enqueue bounded chunks and perform sending in the application.
+
 ## How we know it's correct
 
 - **A deliberately naive reference.** The test suite includes a reference scheduler that visits one queue at a time, never skips anything, and is short enough to check by reading.
@@ -442,7 +480,8 @@ ran report-2
 
 ## How it compares
 
-<!-- Re-verify these facts before each publish. -->
+The third-party comparison below is historical, not a current audit of those
+projects or their maintenance status. Re-verify it before choosing a dependency.
 
 | | dwrr | [tadglines/wfq](https://github.com/tadglines/wfq) | [vanadium drrqueue](https://pkg.go.dev/v.io/x/ref/runtime/internal/lib/bqueue/drrqueue) |
 |---|---|---|---|
@@ -450,9 +489,9 @@ ran report-2
 | Per-item cost | Declared `uint64` | Item size | Buffer size in bytes |
 | Weights | Per queue | Per item, 1–256 | Shared quantum |
 | Retrieval | Does not wait for work: `Take(n)` | Blocking, with `Close` | Blocking `Get` |
-| Size limits | None | Total and per-flow | Not documented |
+| Built-in capacity limits | None (available memory still bounds storage) | Total and per-flow | Not documented |
 | Item type | Generic `T` | `interface{}` | Byte buffers |
-| Status | Maintained | Last updated 2014 | Internal; can't be imported from outside its module |
+| Import scope | Public module | Public package | Internal; cannot be imported from outside its parent tree |
 
 Packages that implement smooth weighted round robin choose which backend receives the next request. They don't hold queued work, so they solve a different problem.
 
