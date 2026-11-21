@@ -31,7 +31,7 @@ The shared target is the fixed-quantum core. This checkout's callable quanta,
 callback errors and speculative scheduling are local extensions, not shared
 requirements. Its generation-exhaustion restriction also qualifies fixed-core
 conformance; see [behavior and limits](#behavior-worth-knowing). The spec's Go
-adapter pins published v0.10.1; replay against this unreleased checkout must be
+adapter pins published v0.10.1; replay against v0.11.0 must be
 identified separately. Go CI tests this checkout, not an automatic current-spec
 replay gate.
 
@@ -48,19 +48,17 @@ Deficit round robin keeps one queue per producer and serves them in turn. Each q
 
 | | |
 |---|---|
-| Latest published release | v0.10.1 (previous API) |
-| This checkout | Unreleased API changes; no release version selected |
+| Release | v0.11.0 (unstable pre-1 API) |
 | Go | 1.22.2 or newer |
 | License | MIT |
-| Install published release | `go get github.com/version2beta/dwrr@v0.10.1` |
+| Install published release | `go get github.com/version2beta/dwrr@v0.11.0` |
 | Repository | [github.com/version2beta/dwrr](https://github.com/version2beta/dwrr) |
 | API reference | [pkg.go.dev/github.com/version2beta/dwrr](https://pkg.go.dev/github.com/version2beta/dwrr) |
 
-This README and its examples describe the **unreleased working-tree API**, not
-v0.10.1. Installing v0.10.1 does not provide callable quanta or the two-result
-`Take` below; see the [v0.10.1 documentation](https://github.com/version2beta/dwrr/tree/v0.10.1)
-for that release. To try these examples before publication, use this checkout
-(for an external consumer, a local `go.mod` `replace` pointing here).
+This README and its examples describe **v0.11.0**, an unstable pre-1 release.
+Installing v0.10.1 does not provide callable quanta or the two-result `Take`
+below; see the [v0.10.1 documentation](https://github.com/version2beta/dwrr/tree/v0.10.1)
+for that previous release.
 
 ### Migrating from v0.10.1
 

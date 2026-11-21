@@ -4,10 +4,10 @@ This repository publishes the Go module `github.com/version2beta/dwrr`.
 
 ## Local preparation (no publication)
 
-The working-tree API is unreleased; v0.10.1 is the latest published release.
-No next version has been selected. Local checks do not authorize commits, tags,
-pushes or publication. Preserve uncommitted work and keep raw logs outside the
-repository. See [HANDOFF.md](HANDOFF.md) for the current scoped evidence and gaps.
+The selected release is v0.11.0, an unstable pre-1 minor release for the breaking
+API changes since v0.10.1. The module path is unchanged. Local checks do not
+authorize commits, tags, pushes or publication. Preserve uncommitted work and
+keep raw logs outside the repository. See [HANDOFF.md](HANDOFF.md) for the current scoped evidence and gaps.
 
 - [ ] Inspect status/diffs, record HEAD, source state and toolchain/configuration,
   and run `git diff --check`.
@@ -55,8 +55,8 @@ local preparation.
 1. Create and push an annotated version tag, for example:
 
    ```sh
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push origin v0.1.0
+   git tag -a v0.11.0 -m "Release v0.11.0"
+   git push origin v0.11.0
    ```
 
    Use the intended `vX.Y.Z` tag; `go.mod` has no release-version field (its `go`
@@ -65,11 +65,11 @@ local preparation.
 3. Verify the exact version resolves from the Go module proxy and that a consumer can fetch it:
 
    ```sh
-   GOPROXY=https://proxy.golang.org go list -m github.com/version2beta/dwrr@v0.1.0
+   GOPROXY=https://proxy.golang.org go list -m github.com/version2beta/dwrr@v0.11.0
    tmp="$(mktemp -d)"
    cd "$tmp"
    go mod init example.com/dwrr-consumer
-   GOPROXY=https://proxy.golang.org go get github.com/version2beta/dwrr@v0.1.0
+   GOPROXY=https://proxy.golang.org go get github.com/version2beta/dwrr@v0.11.0
    ```
 
    Substitute the release version. For v2+, use the `/v2` module path. Confirm the resolved module and version match the release; `go get` may be run in a temporary consumer module to avoid changing this repository's module state.

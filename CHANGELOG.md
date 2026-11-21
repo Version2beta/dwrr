@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.11.0
 
-No release version has been selected. The latest published release is v0.10.1.
+Unstable pre-1 release; the shared fixed-quantum specification remains a draft.
 
 ### API and behavior
 
