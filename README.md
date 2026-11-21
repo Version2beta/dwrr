@@ -75,6 +75,21 @@ for that previous release.
   state; do not rely on side effects being rolled back or on constant-path speed.
 - Item costs remain fixed at enqueue; callable quanta change allocation, not cost.
 
+## Development checkout
+
+To work on the library rather than install it into an application:
+
+```sh
+git clone https://github.com/version2beta/dwrr.git
+cd dwrr
+git checkout v0.11.0
+go test ./...
+```
+
+Omit the checkout step to develop against the repository's current branch instead
+of the published release. Application consumers should use the `go get` command
+above from their own Go module.
+
 ## Quick start
 
 Two queues, with quanta of 2 and 3. Queue 1's first item costs 4, more than one quantum, so it waits a round to accumulate enough credit.
